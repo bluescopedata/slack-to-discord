@@ -10,15 +10,17 @@ import os
 import re
 import tempfile
 import textwrap
-from zipfile import ZipFile
+import cv2
+from zipfile import ZipFile, ZIP_DEFLATED, ZIP_LZMA
 from datetime import datetime
 from urllib.parse import urlparse
+import io
+import pprint
 
 import discord
 from discord.errors import Forbidden
 
 from slack_to_discord.http_stream import SeekableHTTPStream
-
 
 # Discord size limits
 MAX_MESSAGE_SIZE = 2000
@@ -33,6 +35,7 @@ MSG_FORMAT = "`{time}` {text}"
 BACKUP_THREAD_NAME = "{date} {time}"  # used when the message to create the thread from has no text
 ATTACHMENT_TITLE_TEXT = "<*uploaded a file*> {title}"
 ATTACHMENT_ERROR_APPEND = "\n<file thumbnail used due to size restrictions. See original at <{url}>>"
+ATTACHMENT_ERROR_APPEND_LOCAL_FILE_FAIL = "\n<local file could not upload. Falling back to Slack. See original at <{url}>>"
 
 # Create a separator between dates? (None for no)
 DATE_SEPARATOR = "`{:-^30}`"
@@ -69,6 +72,14 @@ GLOBAL_EMOJI_MAP = {
 
 __log__ = logging.getLogger(__name__)
 
+def handle_exceptions(func):
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            print("An exception occurred:", e)
+            raise e
+    return wrapper
 
 def emoji_replace(s, emoji_map):
     def replace(match):
@@ -116,9 +127,26 @@ def slack_usermap(d, real_names=False):
     r["B01"] = ("Slackbot", None)
     return r
 
+@handle_exceptions
+# def topic(x):
+#     return "\n\n".join([x[k]["value"] for k in ("purpose", "topic") if k in x and x[k]["value"]])
+# def topic(x):
+#     purpose = x.get("purpose", {"value": "Direct Messages", "creator": x.get("user",x["members"][0])["value"], "last_set": x["created"]})["value"]
+#     topic = x.get("topic", {"value": "", "creator": "", "last_set": 0})["value"]
+#     return "\n\n".join([purpose, topic])
+def topic(x):
+    user = x.get("user")
+    if user is None:
+        members = x.get("members")
+        if members:
+            user = members[0]
+        else:
+            user = ""
+    purpose = x.get("purpose", {"value": "Direct Messages", "creator": user, "last_set": x["created"]})["value"]
+    topic = x.get("topic", {"value": "", "creator": "", "last_set": 0})["value"]
+    return "\n\n".join([purpose, topic])
 
 def slack_channels(d):
-    topic = lambda x: "\n\n".join([x[k]["value"] for k in ("purpose", "topic") if x[k]["value"]])
     pins = lambda x: set(p["id"] for p in x.get("pins", []))
 
     for is_private, file in ((False, "channels.json"), (True, "groups.json")):
@@ -128,7 +156,7 @@ def slack_channels(d):
                     yield x["name"], topic(x), pins(x), is_private
 
 
-def slack_filedata(f):
+def slack_filedata(f, data_dir):
     # Make sure the filename has the correct extension
     # Not fixing these issues can cause pictures to not be shown
     name, *ext = (f.get("name") or "unnamed").rsplit(".", 1)
@@ -139,25 +167,28 @@ def slack_filedata(f):
         # extension is already correct, don't fix it
         ft = None
 
-    newname = ".".join(x for x in (name or "unknown", ext, ft) if x)
+    newname = ".".join(x for x in (name or "", ext, ft) if x)
+    somename = newname or "unknown"
 
     # Make a list of thumbnails for this file in case the original can't be posted
-    thumbs = [
-        f[t]
+    local_thumbs = [
+        os.path.join(data_dir, f[t])
         for t in sorted(
-            (k for k in f if re.fullmatch("thumb_(\\d+)", k)),
-            key=lambda x: int(x.split("_")[-1]),
+            (k for k in f if re.fullmatch("thumb_(\\d+)_file", k)),
+            key=lambda x: int(x.split("_")[-2]),
             reverse=True
         )
     ]
-    if "thumb_video" in f:
-        thumbs.append(f["thumb_video"])
+    if "thumb_video_file" in f:
+        local_thumbs.append(f["thumb_video_file"])
+
 
     return {
-        "name": newname,
-        "title": f.get("title") or newname,
+        "name": somename,
+        "title": f.get("title") or somename,
         "url": f["url_private"],
-        "thumbs": thumbs
+        "local_file": os.path.join(data_dir, f["url_private_file"]),
+        "local_thumbs": local_thumbs
     }
 
 
@@ -178,6 +209,7 @@ def slack_channel_messages(d, channel_name, users, emoji_map, pins):
             return "`@{}`".format(target)
         return m.group(0)
 
+    data_dir = d
     channel_dir = os.path.join(d, channel_name)
     if not os.path.isdir(channel_dir):
         __log__.error("Data for channel '#%s' not found in export", channel_name)
@@ -265,7 +297,7 @@ def slack_channel_messages(d, channel_name, users, emoji_map, pins):
                     ]
                     for x in d.get("reactions", [])
                 },
-                "files": [slack_filedata(f) for f in files],
+                "files": [slack_filedata(f, data_dir) for f in files],
                 "events": events
             }
 
@@ -353,6 +385,33 @@ def make_discord_msgs(msg):
         }
         embed = None
 
+def is_supported_image_type(image_path, image_name):
+    try:
+        image = cv2.imread(image_path)
+        with tempfile.TemporaryDirectory() as td:
+            temp_file = os.path.join(td, image_name)
+            with open(temp_file, 'w') as fh:
+                cv2.imwrite(temp_file, image)
+        return image is not None
+    except:
+        return False
+
+def check_image_size_lower_than_target(image_path, target_size):
+    file_stats = os.stat(image_path)
+    return file_stats.st_size > target_size
+
+def scale_image(image_path, target_size, temp_file):
+    image = cv2.imread(image_path)
+    cv2.imwrite(temp_file, image)
+    height, width = image.shape[:2]
+    ratio = 1.0
+
+    while check_image_size_lower_than_target(temp_file, target_size):
+        ratio -= 0.03
+        new_height = int(height * ratio)
+        new_width = int(width * ratio)
+        image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        cv2.imwrite(temp_file, image)
 
 def file_upload_attempts(data):
     # Files that are too big cause issues
@@ -362,19 +421,11 @@ def file_upload_attempts(data):
         yield data
         return
 
-    for i, url in enumerate([fd["url"]] + fd.get("thumbs", [])):
-        if i > 0:
-            # Trying thumbnails - get the filename from Slack (it has the correct extension)
-            filename = urlparse(url).path.rsplit("/", 1)[-1]
-        else:
-            filename = fd["name"]
-
+    for i, local_file in enumerate([fd["local_file"]] + fd.get("local_thumbs", [])):
         try:
-            f = discord.File(
-                fp=SeekableHTTPStream(url),
-                filename=filename
-            )
-        except Exception:
+            __log__.info("attempting file upload '%s'", local_file)
+            f = discord.File(local_file)
+        except Exception as e:
             pass
         else:
             yield {
@@ -382,9 +433,46 @@ def file_upload_attempts(data):
                 "file": f
             }
 
-        # The original URL failed - trying thumbnails
-        if i < 1:
-            data["content"] += ATTACHMENT_ERROR_APPEND.format(**fd)
+    try:
+        # The local files are likely too big, try and shrink image uploads to under 8 mb, or zip any other file types.
+        last_attempt_local_file = discord.File(fd["local_file"])
+        if check_image_size_lower_than_target(fd["local_file"], 8388284):
+            if is_supported_image_type(fd["local_file"], fd["name"]):
+                __log__.info("attempting to reduce image size and upload file '%s'", fd["local_file"])
+                with tempfile.TemporaryDirectory() as td:
+                    temp_file = os.path.join(td, fd["name"])
+                    with open(temp_file, 'w') as fh:
+                        # Now the file is written and closed and can be used for reading.
+                        scale_image(fd["local_file"], 8388284, temp_file)
+                        last_attempt_local_file = discord.File(temp_file,filename=fd["name"])
+            else:
+                __log__.info("attempting zipped file upload for '%s'", fd["local_file"])
+                b = io.BytesIO()
+                zipf = ZipFile(b, "w", ZIP_DEFLATED, compresslevel=9)
+                zipf.write(fd["local_file"])
+                zipf.close()
+                b.seek(0)
+                last_attempt_local_file = discord.File(b, filename=fd["name"]+".zip")
+
+                for info in zipf.infolist():
+                    __log__.info("Compressed size: '%s' bytes", info.compress_size)
+                #     print(f"Filename: {info.filename}")
+                #     print(f"Modified: {datetime(*info.date_time)}")
+                #     print(f"Normal size: {info.file_size} bytes")
+                #     print(f"Compressed size: {info.compress_size} bytes")
+                #     print("-" * 20)
+        else:
+            raise Exception("The filesize is not the problem.")
+    except Exception as e:
+        pass
+    else:
+        yield {
+            **data,
+            "file": last_attempt_local_file
+        }
+
+    # The local files failed - trying slack fallback thumbnails
+    data["content"] += ATTACHMENT_ERROR_APPEND_LOCAL_FILE_FAIL.format(**fd)
 
     __log__.error("Failed to upload file for message '%s'", data["content"])
 
@@ -448,11 +536,15 @@ class SlackImportClient(discord.Client):
         for data in make_discord_msgs(msg):
             for attempt in file_upload_attempts(data):
                 with contextlib.suppress(Exception):
-                    sent = await send(
-                        username=msg["userinfo"][0],
-                        avatar_url=msg["userinfo"][1],
-                        **attempt
-                    )
+                    try:
+                        sent = await send(
+                            username=msg["userinfo"][0],
+                            avatar_url=msg["userinfo"][1],
+                            **attempt
+                        )
+                    except Exception as e:
+                        __log__.error("Failed to post file with error: '%s'", e)
+                        raise e
                     if pin:
                         pin = False
                         # Requires the "manage messages" optional permission
@@ -460,7 +552,7 @@ class SlackImportClient(discord.Client):
                             await sent.pin()
                     break
             else:
-                __log__.error("Failed to post message: '%s'", data["content"])
+                __log__.error("Failed to post message: '%s' with error: '%s'", data["content"])
 
         return sent
 
