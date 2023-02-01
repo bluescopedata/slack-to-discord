@@ -28,7 +28,7 @@ MAX_THREADNAME_SIZE = 100
 
 # Date and time formats
 DATE_FORMAT = "%Y-%m-%d"
-TIME_FORMAT = "%H:%M"
+TIME_FORMAT = "%Y-%m-%d %H:%M"
 
 # Formatting options for messages
 MSG_FORMAT = "`{time}` {text}"
